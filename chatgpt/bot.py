@@ -4,27 +4,27 @@ import json
 import re
 import time
 import datetime
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 from maubot import Plugin, MessageEvent
 from maubot.handlers import command
 from mautrix.types import TextMessageEventContent, MessageType, EventType, Format, EventID
 from mautrix.util import markdown
-from openai import OpenAI
 
 from .config import Config
 from .services.weather_service import get_weather
 from .services.electricity_service import ElectricityService
+from .services.ai_service import AIService
 
 class ChatGPTBot(Plugin):
-    """A Matrix bot that interfaces with OpenAI's ChatGPT."""
+    """A Matrix bot that interfaces with OpenAI's ChatGPT and Mistral AI."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.assistant_replies: Dict[str, str] = {}
         self.max_messages = 100
-        self.api_base = None
         self.electricity_service = None
+        self.ai_service = None
 
     @classmethod
     def get_config_class(cls):
@@ -35,11 +35,25 @@ class ChatGPTBot(Plugin):
         await super().start()
         self.config.load_and_update()
         self.electricity_service = ElectricityService(vat_multiplier=self.config["vat"])
-        self.api_base = self.config.get("api-endpoint", None)
-        self.api_base = self.api_base if self.api_base != '' else None
+        
+        # Initialize AI service
+        openai_api_base = self.config.get("api-endpoint", None)
+        openai_api_base = openai_api_base if openai_api_base != '' else None
+        
+        mistral_api_base = self.config.get("mistral-api-endpoint", None)
+        mistral_api_base = mistral_api_base if mistral_api_base != '' else None
+        
+        self.ai_service = AIService(
+            openai_api_key=self.config["api-key"],
+            openai_api_base=openai_api_base,
+            mistral_api_key=self.config["mistral-api-key"],
+            mistral_api_base=mistral_api_base,
+            allowed_models=self.config["allowed_models"],
+            mistral_allowed_models=self.config["mistral-allowed-models"]
+        )
 
     async def chat_gpt_request(self, query: str, conversation_history: list, evt: MessageEvent, event_id: EventID) -> None:
-        """Process a ChatGPT request.
+        """Process a chat request.
         
         Args:
             query: The user's query
@@ -107,138 +121,120 @@ class ChatGPTBot(Plugin):
 
         # Check for model override
         pattern = re.compile("![\w-]+")
-        override_model = None
+        model = self.config["model"]  # Default model
         for message in messages:
             content = message["content"]
             match = pattern.search(content)
             if match:
-                override_model = match.group(0)[1:]
+                model = match.group(0)[1:]
                 message["content"] = re.sub(pattern, "", content, count=1).strip()
                 break
 
-        if override_model and override_model not in self.config["allowed_models"]:
-            await self._edit(evt.room_id, event_id, f"Invalid model: {override_model}")
+        try:
+            is_mistral = self.ai_service.is_mistral_model(model)
+            chat_completion = self.ai_service.create_chat_completion(
+                messages=messages,
+                model=model,
+                tools=None if is_mistral else tools,
+                stream=True
+            )
+        except ValueError as e:
+            await self._edit(evt.room_id, event_id, str(e))
+            return
+        except Exception as e:
+            await self._edit(evt.room_id, event_id, f"API Error: {e}")
             return
 
-        start_time = time.time()
-        max_retries = 5
+        collected_messages = []
+        collected_functions = {}
+        delay = 1
 
-        for i2 in range(4 + max_retries + 1):
-            for retry in range(max_retries + 1):
-                try:
-                    client = OpenAI(api_key=self.config["api-key"], base_url=self.api_base)
-                    if override_model in ["o1-mini", "o1", "o1-preview", "o3-mini"]:
-                        messages[0]["role"] = "user"
-                        chat_completion = client.chat.completions.create(
-                            model=override_model,
-                            messages=messages,
-                            stream=True,
-                        )
-                    else:
-                        chat_completion = client.chat.completions.create(
-                            model=override_model if override_model else self.config["model"],
-                            messages=messages,
-                            tools=tools,
-                            stream=True,
-                        )
-                    break
-                except Exception as e:
-                    if retry < max_retries:
-                        print(f"Retry {retry + 1}/{max_retries}: {e}")
-                        continue
-                    await self._edit(evt.room_id, event_id, f"OpenAI API Error: {e}")
-                    return
+        for chunk in chat_completion:
+            processed = self.ai_service.process_chunk(chunk, is_mistral)
+            chunk_message = processed["content"]
+            tool_calls = processed["tool_calls"]
 
-            collected_chunks = []
-            collected_messages = []
-            collected_functions = {}
-            delay = 1
+            if tool_calls:
+                for tool_call in tool_calls:
+                    if tool_call.id is not None:
+                        tool_call_id = tool_call.id
+                    if tool_call.function.name is not None:
+                        collected_functions[tool_call_id] = {
+                            "name": tool_call.function.name,
+                            "arguments": ""
+                        }
+                    if tool_call.function.arguments is not None:
+                        collected_functions[tool_call_id]["arguments"] += tool_call.function.arguments
 
-            for chunk in chat_completion:
-                chunk_time = time.time() - start_time
-                collected_chunks.append(chunk)
-                chunk_message = chunk.choices[0].delta.content
+            if chunk_message:
+                collected_messages.append(chunk_message)
 
-                if chunk.choices[0].delta.tool_calls:
-                    for tool_call in chunk.choices[0].delta.tool_calls:
-                        if tool_call.id is not None:
-                            tool_call_id = tool_call.id
-                        if tool_call.function.name is not None:
-                            collected_functions[tool_call_id] = {
-                                "name": tool_call.function.name,
-                                "arguments": ""
-                            }
-                        if tool_call.function.arguments is not None:
-                            collected_functions[tool_call_id]["arguments"] += tool_call.function.arguments
+            last_edit_time = getattr(self, "_last_edit_time", None)
+            if last_edit_time is not None:
+                elapsed_time = time.time() - last_edit_time
+                if elapsed_time < delay and not processed["finish_reason"]:
+                    continue
 
-                if chunk_message:
-                    collected_messages.append(chunk_message)
-
-                last_edit_time = getattr(self, "_last_edit_time", None)
-                if last_edit_time is not None:
-                    elapsed_time = time.time() - last_edit_time
-                    if elapsed_time < delay and chunk.choices[0].finish_reason is None:
-                        continue
-
-                self._last_edit_time = time.time()
-                try:
-                    full_reply_content = ''.join(collected_messages)
-                except:
-                    pass
-
-                if chunk.choices[0].finish_reason is None or chunk.choices[0].finish_reason == "tool_calls":
-                    full_reply_content += "…"
-                await self._edit(evt.room_id, event_id, f"{full_reply_content}")
-
-            if collected_functions:
-                full_reply_content = "Calling functions: "
-                for tool_id, collected_function in collected_functions.items():
-                    function_args = json.loads(collected_function["arguments"])
-                    full_reply_content += f"{collected_function['name']}({function_args}) "
-                await self._edit(evt.room_id, event_id, f"{full_reply_content}")
-
-                available_functions = {
-                    "weather": get_weather,
-                    "fetch_electricity_prices": self.electricity_service.fetch_prices
-                }
-
-                for tool_id, collected_function in collected_functions.items():
-                    try:
-                        function_args = json.loads(collected_function["arguments"])
-                        function_args["user"] = sender_name
-                    except:
-                        function_args = []
-
-                    try:
-                        function_to_call = available_functions[collected_function["name"]]
-                        function_response = function_to_call(**function_args)
-                    except Exception as e:
-                        available_functions = str(list(available_functions.keys()))
-                        function_response = f"Function error: {e}"
-
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": tool_id,
-                            "type": "function",
-                            "function": {
-                                "name": collected_function["name"],
-                                "arguments": json.dumps(function_args)
-                            }
-                        }]
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_id,
-                        "name": collected_function["name"],
-                        "content": function_response,
-                    })
-
+            self._last_edit_time = time.time()
+            try:
+                full_reply_content = ''.join(collected_messages)
+            except:
                 continue
 
+            if not processed["finish_reason"] or processed["finish_reason"] == "tool_calls":
+                full_reply_content += "…"
+            await self._edit(evt.room_id, event_id, f"{full_reply_content}")
+
+        if collected_functions:
+            full_reply_content = "Calling functions: "
+            for tool_id, collected_function in collected_functions.items():
+                function_args = json.loads(collected_function["arguments"])
+                full_reply_content += f"{collected_function['name']}({function_args}) "
+            await self._edit(evt.room_id, event_id, f"{full_reply_content}")
+
+            available_functions = {
+                "weather": get_weather,
+                "fetch_electricity_prices": self.electricity_service.fetch_prices
+            }
+
+            for tool_id, collected_function in collected_functions.items():
+                try:
+                    function_args = json.loads(collected_function["arguments"])
+                    function_args["user"] = sender_name
+                except:
+                    function_args = []
+
+                try:
+                    function_to_call = available_functions[collected_function["name"]]
+                    function_response = function_to_call(**function_args)
+                except Exception as e:
+                    available_functions = str(list(available_functions.keys()))
+                    function_response = f"Function error: {e}"
+
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {
+                            "name": collected_function["name"],
+                            "arguments": json.dumps(function_args)
+                        }
+                    }]
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "name": collected_function["name"],
+                    "content": function_response,
+                })
+
+            # Make another request with the function results
+            await self.chat_gpt_request("", messages[:-1], evt, event_id)
+        else:
             full_reply_content = ''.join(collected_messages)
-            return
+            await self._edit(evt.room_id, event_id, full_reply_content)
 
     async def get_conversation_history(self, evt: MessageEvent, event_id: str) -> list:
         """Get the conversation history for a given event.

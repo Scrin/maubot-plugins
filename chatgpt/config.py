@@ -16,4 +16,8 @@ class Config(BaseProxyConfig):
         helper.copy("model")
         helper.copy("allowed_models")
         helper.copy("vat")
-        helper.copy("api-endpoint") 
+        helper.copy("api-endpoint")
+        # Mistral AI settings
+        helper.copy("mistral-api-key")
+        helper.copy("mistral-api-endpoint")
+        helper.copy("mistral-allowed-models") 
